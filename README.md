@@ -1,4 +1,4 @@
-# HRM-RLVR
+# HRM-Text-RLVR
 
 RLVR (Reinforcement Learning with Verifiable Rewards) training for
 [**DFM Mimir**](https://huggingface.co/danish-foundation-models/DFM-Mimir)
