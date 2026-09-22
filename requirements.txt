@@ -1,0 +1,22 @@
+# RLVR / GRPO training deps for train_grpo.py. Verified working set as of 2026-09-22
+# (pinned versions below are what was tested; >= constraints are the actual floor).
+#
+# torch is intentionally left unpinned: install the CUDA build that matches your GPU
+# server first, e.g.
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+# then install the rest of this file. If torch is already provided by the server image,
+# skip it entirely and just install everything below.
+torch>=2.13
+
+transformers>=5.13.1   # ships HrmTextForCausalLM (hrm_text) natively -- no trust_remote_code
+trl>=1.13               # <1.13 crashes importing GRPOTrainer against transformers>=5.13 (see CLAUDE.md)
+datasets>=4.7            # trl>=1.13's floor
+accelerate>=1.6
+math-verify>=0.9
+
+# --lora
+peft>=0.19
+
+# W&B tracking (on by default for real runs; run `wandb login` once). Drop this line
+# and pass --report-to none if you don't want it.
+wandb>=0.19
