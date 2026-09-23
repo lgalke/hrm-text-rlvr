@@ -5,7 +5,7 @@ rewarded 1.0 for a numerically-correct final answer (plus a small bonus for
 emitting the answer in a parseable format), using TRL's ``GRPOTrainer``.
 
 **Why this isn't just ``trl.GRPOTrainer`` out of the box.** DFM-Mimir
-(``hrm_text``, see ``danish-foundation-models/DFM-Mimir`` / ``config.json``'s
+(``hrm_text``, see ``danish-foundation-models/DFM-Mimir-v1.5`` / ``config.json``'s
 ``"prefix_lm": true``) is trained with the *prompt* attended to bidirectionally
 and only the *completion* attended to causally -- ``HrmTextModel.forward`` turns
 this on via ``token_type_ids`` (1 = bidirectional block, 0/absent = causal):
@@ -56,7 +56,7 @@ Usage
 -----
     python train_grpo.py --smoke-test                  # ~2 min on a Mac, sanity only, no wandb
     python train_grpo.py --check-prefix-lm              # bidirectional vs causal prompt, quick GSM8K probe
-    python train_grpo.py                                # full run, danish-foundation-models/DFM-Mimir, GSM8K
+    python train_grpo.py                                # full run, danish-foundation-models/DFM-Mimir-v1.5, GSM8K
     python train_grpo.py --lora                          # LoRA instead of full fine-tune
     python train_grpo.py --no-reasoning                  # direct answers, short completions
     python train_grpo.py --report-to none                # disable W&B
@@ -73,10 +73,11 @@ import re
 
 import torch
 from datasets import Dataset, load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.trainer_optimizer import is_optimizer_factory
 from trl import GRPOConfig, GRPOTrainer
 
-DEFAULT_MODEL = "danish-foundation-models/DFM-Mimir"
+DEFAULT_MODEL = "danish-foundation-models/DFM-Mimir-v1.5"
 
 # The thought-channel opener that actually elicits reasoning (see module docstring
 # and eval.py's _THINK_PREFILL). A no-op string when --no-reasoning is passed.
@@ -86,6 +87,38 @@ INSTRUCTION = (
     "Solve the problem. Finish your response with a final line in exactly this "
     "form, with no other text after it:\nAnswer: <number>"
 )
+
+
+# --------------------------------------------------------------------------- #
+# Per-module learning-rate scaling for the H/L recurrent modules.
+# --------------------------------------------------------------------------- #
+def compute_module_lr_scales(config) -> dict[str, int]:
+    """How many gradient-carrying applications the H- and L-modules receive in one
+    forward+backward pass, i.e. the LR divisors k_H, k_L from ``eta_M = eta / k_M``
+    (see the module docstring's "Per-module learning-rate scaling" paragraph).
+
+    Replicates ``HrmTextModel.__init__``/``.forward`` (transformers'
+    ``models/hrm_text/modeling_hrm_text.py``) exactly:
+
+    - The H-module call is never wrapped in ``torch.no_grad()`` -- it receives
+      gradient on every one of its ``H_cycles`` applications. So ``k_H = H_cycles``,
+      unconditionally.
+    - The L-module is truncated per ``config.L_bp_cycles``: left-padded with 1s to
+      length ``H_cycles`` (``L_bp_cycles_padded = [1] * max(0, H_cycles - len(raw))
+      + raw``), then for H-cycle ``h`` the trailing ``L_bp_cycles_padded[h]`` of the
+      ``L_cycles`` L-iterations run with grad. So
+      ``k_L = sum(clamp(L_bp_cycles_padded[h], 0, L_cycles) for h in range(H_cycles))``.
+
+    For the shipped Mimir config (``H_cycles=2, L_cycles=3, L_bp_cycles=[0, 3]``,
+    i.e. cycle pattern ``LLLHLLLH`` truncated to ``HLLLH``), this gives ``k_H=2``,
+    ``k_L=3``.
+    """
+    h_cycles = config.H_cycles
+    l_cycles = config.L_cycles
+    raw_bp = list(config.L_bp_cycles)
+    padded = [1] * max(0, h_cycles - len(raw_bp)) + raw_bp
+    k_l = sum(min(max(padded[h], 0), l_cycles) for h in range(h_cycles))
+    return {"H": h_cycles, "L": max(k_l, 1)}
 
 
 # --------------------------------------------------------------------------- #
@@ -207,14 +240,23 @@ class PrefixLMGRPOTrainer(GRPOTrainer):
 
     ``prefill_ids`` is the tokenized reasoning prefill (``THINK_PREFILL``, or
     ``[]`` when reasoning is disabled).
+
+    ``lr_scales`` (optional ``{"H": k_H, "L": k_L}``, see ``compute_module_lr_scales``)
+    additionally overrides ``create_optimizer`` to divide the base LR by ``k_H``/``k_L``
+    for H-/L-module parameters -- everything else (embeddings, ``lm_head``) trains at
+    the base LR. ``None`` skips this and falls back to the stock single-LR optimizer.
     """
 
-    def __init__(self, *args, prefill_ids: list[int] | None = None, **kwargs):
+    def __init__(
+        self, *args, prefill_ids: list[int] | None = None,
+        lr_scales: dict[str, float] | None = None, **kwargs,
+    ):
         # Stored before super().__init__() (which never calls _tokenize_prompts
         # itself -- that only happens at train/eval time) so both overrides can
         # rely on it as soon as rollouts start.
         self._prefill_ids = list(prefill_ids or [])
         self._prefill_len = len(self._prefill_ids)
+        self._lr_scales = lr_scales
         super().__init__(*args, **kwargs)
 
     def _tokenize_prompts(self, prompts: list):
@@ -249,6 +291,83 @@ class PrefixLMGRPOTrainer(GRPOTrainer):
             model, input_ids, attention_mask, logits_to_keep, *args,
             token_type_ids=token_type_ids, **kwargs,
         )
+
+    @staticmethod
+    def _module_bucket(param_name: str) -> str:
+        # Substring match, not startswith: under --lora, PEFT renames params to
+        # "base_model.model.model.L_module.layers.N....lora_A.default.weight", and
+        # ".L_module." still appears in the middle. A prefix check would silently
+        # match nothing under LoRA and the run would carry on unscaled.
+        if ".H_module." in param_name:
+            return "H"
+        if ".L_module." in param_name:
+            return "L"
+        return "other"
+
+    def create_optimizer(self, model=None):
+        """Split each of ``Trainer``'s decay/no-decay param groups further by
+        H-/L-module membership, and give the H/L groups their own scaled ``"lr"``
+        (see ``compute_module_lr_scales`` / ``lr_scales`` above). Falls back to the
+        stock single-LR optimizer when ``lr_scales`` is ``None``.
+        """
+        if self.optimizer is not None:
+            return self.optimizer
+        if self._lr_scales is None:
+            return super().create_optimizer(model)
+
+        opt_model = self.model if model is None else model
+        if self.optimizer_cls_and_kwargs is not None:
+            optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
+        else:
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+
+        if is_optimizer_factory(optimizer_cls) or any(
+            k in optimizer_kwargs for k in ("params", "model", "optimizer_dict")
+        ):
+            # Custom optimizer factories (Muon/Dion) and GaLore/LOMO/layer-wise-dummy
+            # setups manage their own param grouping; don't fight them here.
+            return super().create_optimizer(model)
+
+        base_lr = optimizer_kwargs.get("lr", self.args.learning_rate)
+        scales = {"H": self._lr_scales["H"], "L": self._lr_scales["L"], "other": 1.0}
+        decay_names = set(self.get_decay_parameter_names(opt_model))
+
+        # "other" first: Trainer._get_learning_rate() logs get_last_lr()[0], i.e.
+        # only the first group's LR -- keep the unscaled group there so the
+        # dashboard's "learning_rate" metric isn't a scaled (misleading) value.
+        grouped_params: list[dict] = []
+        counts = {"H": 0, "L": 0, "other": 0}
+        for bucket_name in ("other", "H", "L"):
+            for decay in (True, False):
+                params = [
+                    p for n, p in opt_model.named_parameters()
+                    if p.requires_grad
+                    and self._module_bucket(n) == bucket_name
+                    and (n in decay_names) == decay
+                ]
+                counts[bucket_name] += len(params)
+                if params:
+                    grouped_params.append({
+                        "params": params,
+                        "weight_decay": self.args.weight_decay if decay else 0.0,
+                        "lr": base_lr / scales[bucket_name],
+                    })
+
+        # Fail loudly on full fine-tunes if H or L ended up empty -- that means the
+        # substring match broke, not that scaling was (silently) skipped. Under
+        # --lora, an empty "other" bucket is expected (embeddings/lm_head aren't
+        # LoRA targets), so only H/L are asserted non-empty.
+        for bucket_name in ("H", "L"):
+            if counts[bucket_name] == 0:
+                raise RuntimeError(
+                    f"lr_scales is set but no trainable parameter matched the {bucket_name} "
+                    "module -- the H/L substring match is broken; check HrmTextModel's module names."
+                )
+
+        optimizer_kwargs = dict(optimizer_kwargs)
+        optimizer_kwargs.pop("lr", None)  # each group now carries its own "lr"
+        self.optimizer = optimizer_cls(grouped_params, **optimizer_kwargs)
+        return self.optimizer
 
 
 # --------------------------------------------------------------------------- #
@@ -349,6 +468,34 @@ def run_self_check(trainer: PrefixLMGRPOTrainer, tokenizer, reasoning: bool) -> 
     print(f"[self-check] {len(prompts)}/{len(prompts)} prompts: single BOS, token_type_ids OK, template OK")
 
 
+def run_lr_scaling_check(trainer: PrefixLMGRPOTrainer, base_lr: float) -> None:
+    """Build the real optimizer and assert the H/L param groups got the expected
+    scaled LR -- a cheap, real check that doesn't require an optimizer step.
+    """
+    optimizer = trainer.create_optimizer()
+    lrs_by_bucket: dict[str, set[float]] = {"H": set(), "L": set(), "other": set()}
+    name_by_param = {id(p): n for n, p in trainer.model.named_parameters()}
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            bucket = trainer._module_bucket(name_by_param[id(p)])
+            lrs_by_bucket[bucket].add(group["lr"])
+
+    expected = {
+        "H": base_lr / trainer._lr_scales["H"],
+        "L": base_lr / trainer._lr_scales["L"],
+        "other": base_lr,
+    }
+    for bucket, want in expected.items():
+        got = lrs_by_bucket[bucket]
+        assert got, f"no optimizer param group found for {bucket!r}"
+        assert got == {want}, f"{bucket!r} group(s) have lr={got}, expected {{{want}}}"
+
+    print(
+        f"[self-check] optimizer param groups: H=lr/{trainer._lr_scales['H']:g}, "
+        f"L=lr/{trainer._lr_scales['L']:g}, other=lr (base_lr={base_lr:.2e})"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # CLI / main.
 # --------------------------------------------------------------------------- #
@@ -380,7 +527,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-generations", type=int, default=8)
     parser.add_argument("--per-device-train-batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument(
+        "--learning-rate", type=float, default=1e-5,
+        help="Base LR eta, before the H/L dividers below (default: %(default)s -- "
+             "DFM-Mimir-v1.5's end-of-pretraining LR, pre-divider).",
+    )
+
+    lr_scaling = parser.add_mutually_exclusive_group()
+    lr_scaling.add_argument(
+        "--lr-module-scaling", dest="lr_module_scaling", action="store_true", default=True,
+        help="Divide the base LR per recurrent module by how many gradient-carrying "
+             "applications it receives (eta_M = eta / k_M), auto-computed from the "
+             "loaded model's H_cycles/L_cycles/L_bp_cycles (default).",
+    )
+    lr_scaling.add_argument(
+        "--no-lr-module-scaling", dest="lr_module_scaling", action="store_false",
+        help="Disable per-module LR scaling; train H/L/everything at the base LR.",
+    )
+    parser.add_argument("--h-lr-scale", type=float, default=None,
+                         help="Override the auto-computed H-module LR divisor k_H.")
+    parser.add_argument("--l-lr-scale", type=float, default=None,
+                         help="Override the auto-computed L-module LR divisor k_L.")
     parser.add_argument("--num-train-epochs", type=float, default=1.0)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--max-completion-length", type=int, default=None,
@@ -493,6 +660,20 @@ def main() -> None:
 
     model_init_kwargs = dict(dtype=args.dtype, attn_implementation=args.attn_implementation)
 
+    lr_scales = None
+    if args.lr_module_scaling:
+        # Cheap: config only, no weights. H/L cycle counts are fixed by the
+        # checkpoint, so this can happen before the (slow) full model load below.
+        model_config = AutoConfig.from_pretrained(args.model)
+        lr_scales = compute_module_lr_scales(model_config)
+        if args.h_lr_scale is not None:
+            lr_scales["H"] = args.h_lr_scale
+        if args.l_lr_scale is not None:
+            lr_scales["L"] = args.l_lr_scale
+        print(f"[lr-scaling] H: lr/{lr_scales['H']:g} = {args.learning_rate / lr_scales['H']:.2e}, "
+              f"L: lr/{lr_scales['L']:g} = {args.learning_rate / lr_scales['L']:.2e}, "
+              f"other: lr = {args.learning_rate:.2e}")
+
     peft_config = None
     if args.lora:
         from peft import LoraConfig
@@ -579,10 +760,13 @@ def main() -> None:
         processing_class=tokenizer,
         peft_config=peft_config,
         prefill_ids=prefill_ids,
+        lr_scales=lr_scales,
     )
 
     if args.smoke_test:
         run_self_check(trainer, tokenizer, args.reasoning)
+        if lr_scales is not None:
+            run_lr_scaling_check(trainer, args.learning_rate)
 
     resume = args.resume_from_checkpoint
     if resume == "auto":

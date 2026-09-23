@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-RLVR (GRPO) training for `danish-foundation-models/DFM-Mimir`, an HRM-Text model
+RLVR (GRPO) training for `danish-foundation-models/DFM-Mimir-v1.5` (default checkpoint), an HRM-Text model
 (`hrm_text` architecture, `HrmTextForCausalLM`, native in `transformers>=5.13`, not
 `trust_remote_code`). `train_grpo.py` is the whole deliverable; it has no test suite, linter, or
 build step — it's a single-file research script. See `README.md` for setup and usage; this file
@@ -22,7 +22,8 @@ python -m py_compile train_grpo.py                 # only "build" step there is
 There are no automated tests. Correctness for the PrefixLM plumbing is checked by
 `run_self_check()` (invoked automatically under `--smoke-test`), which asserts on a real batch
 built via `PrefixLMGRPOTrainer._tokenize_prompts` — read that function before changing prompt
-rendering, since it's the thing the assertions pin down.
+rendering, since it's the thing the assertions pin down. `run_lr_scaling_check()` (same gate)
+builds the real optimizer and asserts the H-/L-module param groups got the expected scaled LR.
 
 ## Architecture
 
@@ -45,6 +46,20 @@ training distributions diverge silently — there's no runtime error, just a mod
 wrong the way the docstring's ARC probe (0.71 → 0.12) describes. When touching either override,
 re-run `--smoke-test` and read its three self-check assertions (single BOS, `token_type_ids`
 shape/values, chat-template rendering) before trusting the diff.
+
+**Per-module LR scaling.** `compute_module_lr_scales` derives the H-/L-module LR divisors from
+the loaded checkpoint's `H_cycles`/`L_cycles`/`L_bp_cycles` config, replicating
+`HrmTextModel`'s own gradient-truncation logic exactly (H always gets gradient on every
+application; L is truncated per `L_bp_cycles` — see the function's docstring for the derivation
+and the source lines it tracks). `PrefixLMGRPOTrainer.create_optimizer` applies the result as
+per-parameter-group `"lr"` overrides, matched by **substring** (`.H_module.`/`.L_module.`, not
+`.startswith()`) — under `--lora`, PEFT renames params to
+`base_model.model.model.L_module.layers.N....lora_A.default.weight`, and only the substring
+still matches; a prefix check would silently train everything at one LR. It raises instead of
+silently no-op-ing if H or L ends up empty during a full fine-tune (an empty "other" bucket
+under `--lora` is expected and fine). If `modeling_hrm_text.py`'s gradient-truncation logic ever
+changes, `compute_module_lr_scales` needs to be updated to match it — it isn't derived
+automatically from the model code.
 
 **Reward functions** (`correctness_reward`, `format_reward`) anchor on the *last* `Answer:
 <number>` line in the completion — this is what makes them robust to a reasoning trace that

@@ -1,7 +1,7 @@
 # HRM-Text-RLVR
 
 RLVR (Reinforcement Learning with Verifiable Rewards) training for
-[**DFM Mimir**](https://huggingface.co/danish-foundation-models/DFM-Mimir)
+[**DFM Mimir**](https://huggingface.co/danish-foundation-models/DFM-Mimir-v1.5)
 ([tech report](https://arxiv.org/abs/2608.13517)), an HRM-Text model with a
 Gemma-style tokenizer and chat template, using GRPO ([TRL](https://github.com/huggingface/trl)'s
 `GRPOTrainer`). Kicked off with GSM8K; the reward/dataset pieces are meant to be swapped out for
@@ -54,7 +54,7 @@ python train_grpo.py --smoke-test
 # answers with bidirectional vs. fully-causal prompt attention and compares accuracy.
 python train_grpo.py --check-prefix-lm
 
-# Full run (danish-foundation-models/DFM-Mimir, GSM8K, single GPU, full fine-tune).
+# Full run (danish-foundation-models/DFM-Mimir-v1.5, GSM8K, single GPU, full fine-tune).
 python train_grpo.py
 
 # LoRA instead of full fine-tune.
@@ -82,6 +82,25 @@ Two reward functions, weighted `[1.0, 0.2]`:
   GSM8K gold answer numerically, else 0.0. Anchors on the *last* such line, so it's robust to a
   preceding reasoning trace that happens to contain other numbers.
 - **`format_reward`** — 1.0 if a parseable `Answer: <number>` line is present at all.
+
+### Per-module learning-rate scaling
+
+On by default (`--no-lr-module-scaling` disables it). Mimir's H- and L-modules reuse their
+weights across cycles, so one parameter update changes the model's output through every
+application of that module within a forward pass — with AdamW, a module applied (and
+back-propagated through) more often would otherwise move the model function more per optimizer
+step than one applied less often. `train_grpo.py` divides the base LR by the number of
+gradient-carrying applications each module receives, auto-computed from the loaded checkpoint's
+`H_cycles`/`L_cycles`/`L_bp_cycles` (`compute_module_lr_scales`; printed at startup as
+`[lr-scaling] ...`, and everything but H/L trains at the base LR). For the default
+`DFM-Mimir-v1.5` (`H_cycles=2, L_cycles=3, L_bp_cycles=[3, 3]`), that's `H: lr/2`, `L: lr/6`; the
+original `DFM-Mimir` (`L_bp_cycles=[0, 3]`) gives `H: lr/2`, `L: lr/3`. `--h-lr-scale`/
+`--l-lr-scale` override the auto-computed divisors, for ablation or hand-tuning.
+
+`--learning-rate` (the base `lr` above) defaults to `1e-5` — DFM-Mimir-v1.5's
+end-of-pretraining LR *before* dividers, so with scaling on by default, GRPO fine-tuning
+picks up each module at roughly the LR it was already being trained at (`H: 5e-6`, `L: ~1.7e-6`
+for v1.5), rather than an arbitrary RL-fine-tuning default.
 
 ### Reasoning mode
 
