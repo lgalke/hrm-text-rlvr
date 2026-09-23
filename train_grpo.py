@@ -1,8 +1,9 @@
 """RLVR (GRPO) training for DFM Mimir (HRM-Text) on tasks with verifiable rewards.
 
 Kicks off with GSM8K: a policy is rolled out on grade-school math questions and
-rewarded 1.0 for a numerically-correct final answer (plus a small bonus for
-emitting the answer in a parseable format), using TRL's ``GRPOTrainer``.
+rewarded 1.0 for a correct final answer (plus a small bonus for emitting the answer
+in a parseable format), using TRL's ``GRPOTrainer``. ``--dataset math`` swaps in the
+harder MATH benchmark instead -- see "Datasets" below.
 
 **Why this isn't just ``trl.GRPOTrainer`` out of the box.** DFM-Mimir
 (``hrm_text``, see ``danish-foundation-models/DFM-Mimir-v1.5`` / ``config.json``'s
@@ -46,17 +47,33 @@ resumes an interrupted run.
 
 **Periodic validation eval.** Every ``--eval-steps`` steps (default on;
 ``--no-eval`` disables it), the trainer rolls out on a held-out slice of the
-GSM8K *test* split (``--eval-split``/``--eval-samples``) and scores it with
-the same reward functions, logged as ``eval_rewards/correctness_reward/mean``
-etc. -- a genuine train/test split, since GSM8K's ``train`` and ``test`` are
-disjoint. This is what actually answers "is the policy generalizing" as
-opposed to just fitting the training rollouts' reward.
+*test* split (``--eval-split``/``--eval-samples``) and scores it with the same
+reward functions, logged as ``eval_rewards/correctness_reward/mean`` etc. -- a
+genuine train/test split. This is what actually answers "is the policy
+generalizing" as opposed to just fitting the training rollouts' reward. For
+``--dataset math`` this test split is MATH-500 (see below) -- used the same way
+as GSM8K's test split above: a watched validation signal during training, not a
+pristine held-out set reserved only for final reporting.
+
+**Datasets (``--dataset {gsm8k,math}``, default ``gsm8k``).** ``gsm8k`` is
+``openai/gsm8k`` (plain numeric answers, checked by exact float comparison).
+``math`` is ``nlile/hendrycks-MATH-benchmark``'s ``train`` split (12,000
+examples: the canonical Hendrycks MATH 7,500-problem train split + the 4,500
+canonical-test problems *not* in MATH-500), checked with ``math-verify`` for
+LaTeX/symbolic equivalence (fractions, tuples, ``p - q`` vs ``q - p``, ...).
+``nlile``'s ``test`` split **is MATH-500** (OpenAI's *Let's Verify Step by
+Step* eval subset, from ``openai/prm800k`` -- verified this repo's ``test``
+split by exact ``unique_id`` match against ``HuggingFaceH4/MATH-500``, 500/500).
+That split is used for periodic eval and ``--check-prefix-lm``, exactly as
+GSM8K's test split already is -- it's never mixed into *training* rollouts
+(``--dataset-split`` defaults to, and for training should stay, ``train``).
 
 Usage
 -----
     python train_grpo.py --smoke-test                  # ~2 min on a Mac, sanity only, no wandb
-    python train_grpo.py --check-prefix-lm              # bidirectional vs causal prompt, quick GSM8K probe
+    python train_grpo.py --check-prefix-lm              # bidirectional vs causal prompt, quick probe
     python train_grpo.py                                # full run, danish-foundation-models/DFM-Mimir-v1.5, GSM8K
+    python train_grpo.py --dataset math                  # train on MATH instead of GSM8K
     python train_grpo.py --lora                          # LoRA instead of full fine-tune
     python train_grpo.py --no-reasoning                  # direct answers, short completions
     python train_grpo.py --report-to none                # disable W&B
@@ -68,14 +85,22 @@ Usage
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import re
 
 import torch
 from datasets import Dataset, load_dataset
+from math_verify import parse as mv_parse, verify as mv_verify
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_optimizer import is_optimizer_factory
 from trl import GRPOConfig, GRPOTrainer
+
+# math-verify logs a warning per unparseable prediction; with a randomly-initialized
+# or early-training policy that's most predictions. Match trl.rewards.accuracy_reward's
+# own precedent and keep it quiet.
+logging.getLogger("math_verify.parser").setLevel(logging.ERROR)
+logging.getLogger("math_verify.grader").setLevel(logging.ERROR)
 
 DEFAULT_MODEL = "danish-foundation-models/DFM-Mimir-v1.5"
 
@@ -83,9 +108,13 @@ DEFAULT_MODEL = "danish-foundation-models/DFM-Mimir-v1.5"
 # and eval.py's _THINK_PREFILL). A no-op string when --no-reasoning is passed.
 THINK_PREFILL = "<|channel>thought\n"
 
-INSTRUCTION = (
+GSM8K_INSTRUCTION = (
     "Solve the problem. Finish your response with a final line in exactly this "
     "form, with no other text after it:\nAnswer: <number>"
+)
+MATH_INSTRUCTION = (
+    "Solve the problem. Finish your response with a final line in exactly this "
+    "form, with no other text after it:\nAnswer: <answer>"
 )
 
 
@@ -122,7 +151,9 @@ def compute_module_lr_scales(config) -> dict[str, int]:
 
 
 # --------------------------------------------------------------------------- #
-# GSM8K -> GRPO conversational dataset.
+# GSM8K / MATH -> GRPO conversational dataset. Every builder returns
+# {"prompt": [...], "answer": str}; see DATASET_BUILDERS below for the registry
+# that makes them selectable via --dataset.
 # --------------------------------------------------------------------------- #
 def _gold_answer(solution: str) -> str:
     """GSM8K's ``answer`` column is a worked solution ending in ``#### 72``."""
@@ -137,11 +168,40 @@ def build_gsm8k_dataset(split: str = "train", max_samples: int | None = None) ->
 
     def to_prompt(example: dict) -> dict:
         return {
-            "prompt": [{"role": "user", "content": f"{example['question']}\n\n{INSTRUCTION}"}],
+            "prompt": [{"role": "user", "content": f"{example['question']}\n\n{GSM8K_INSTRUCTION}"}],
             "answer": _gold_answer(example["answer"]),
         }
 
     return ds.map(to_prompt, remove_columns=ds.column_names)
+
+
+def build_math_dataset(split: str = "train", max_samples: int | None = None) -> Dataset:
+    """``nlile/hendrycks-MATH-benchmark``'s ``train`` split (12,000 examples) =
+    the canonical Hendrycks MATH 7,500-problem train split + the 4,500 canonical
+    test problems NOT in MATH-500. Its ``test`` split (500 examples) IS MATH-500
+    (OpenAI's *Let's Verify Step by Step* eval subset, from ``openai/prm800k``) --
+    verified by exact ``unique_id`` match against ``HuggingFaceH4/MATH-500``.
+
+    ``split="test"`` (MATH-500) is used for periodic validation eval and
+    ``--check-prefix-lm``, the same way GSM8K's test split already is here --
+    never for training rollouts (``--dataset-split`` should stay ``train``).
+    """
+    ds = load_dataset("nlile/hendrycks-MATH-benchmark", split=split)
+    if max_samples is not None:
+        ds = ds.select(range(min(max_samples, len(ds))))
+
+    def to_prompt(example: dict) -> dict:
+        return {
+            "prompt": [{"role": "user", "content": f"{example['problem']}\n\n{MATH_INSTRUCTION}"}],
+            # Already the clean extracted gold answer (not the worked solution).
+            "answer": example["answer"].strip(),
+        }
+
+    return ds.map(to_prompt, remove_columns=ds.column_names)
+
+
+DATASET_BUILDERS = {"gsm8k": build_gsm8k_dataset, "math": build_math_dataset}
+DATASET_INSTRUCTIONS = {"gsm8k": GSM8K_INSTRUCTION, "math": MATH_INSTRUCTION}
 
 
 def filter_by_prompt_length(ds: Dataset, tokenizer, max_tokens: int) -> Dataset:
@@ -167,32 +227,22 @@ def filter_by_prompt_length(ds: Dataset, tokenizer, max_tokens: int) -> Dataset:
 
 
 # --------------------------------------------------------------------------- #
-# Verifiable reward: numeric correctness + answer-line format.
+# Verifiable reward: correctness (dataset-specific checker) + answer-line format
+# (dataset-agnostic).
 # --------------------------------------------------------------------------- #
 # Anchors on the LAST "Answer: X" line, exactly like eval.py's _split_reasoning:
 # robust to a preceding thought-channel trace, which may itself contain numbers
-# or the word "answer".
-_ANSWER_LINE = re.compile(r"(?im)^[ \t]*answer[ \t]*:[ \t]*(-?\$?[\d,]*\.?\d+)")
+# or the word "answer". Captures the whole rest of the line (not just a numeric
+# pattern) so it works for both GSM8K's plain numbers and MATH's LaTeX/symbolic
+# answers (fractions, tuples, "p - q", ...).
+_ANSWER_LINE = re.compile(r"(?im)^[ \t]*answer[ \t]*:[ \t]*(.+)$")
 _ANY_NUMBER = re.compile(r"-?\d[\d,]*\.?\d*")
 
 
-def _extract_prediction(text: str) -> float | None:
+def _answer_line_text(text: str) -> str | None:
+    """Raw text of the LAST 'Answer: ...' line, or None if absent."""
     matches = list(_ANSWER_LINE.finditer(text))
-    if matches:
-        raw = matches[-1].group(1)
-    else:
-        # No "Answer:" line at all -- fall back to the last number in the
-        # completion so a near-miss still gets partial signal from format_reward
-        # even though correctness_reward will very likely score it 0.
-        found = _ANY_NUMBER.findall(text)
-        if not found:
-            return None
-        raw = found[-1]
-    raw = raw.replace(",", "").replace("$", "")
-    try:
-        return float(raw)
-    except ValueError:
-        return None
+    return matches[-1].group(1).strip() if matches else None
 
 
 def _completion_text(completion) -> str:
@@ -202,25 +252,78 @@ def _completion_text(completion) -> str:
     return completion
 
 
-def correctness_reward(completions, answer, **kwargs) -> list[float]:
-    rewards = []
-    for completion, gold in zip(completions, answer):
-        pred = _extract_prediction(_completion_text(completion))
-        try:
-            gold_val = float(gold)
-        except (TypeError, ValueError):
-            gold_val = None
-        correct = pred is not None and gold_val is not None and abs(pred - gold_val) < 1e-4
-        rewards.append(1.0 if correct else 0.0)
-    return rewards
-
-
 def format_reward(completions, **kwargs) -> list[float]:
-    rewards = []
-    for completion in completions:
-        text = _completion_text(completion)
-        rewards.append(1.0 if _ANSWER_LINE.search(text) else 0.0)
-    return rewards
+    return [1.0 if _answer_line_text(_completion_text(c)) is not None else 0.0 for c in completions]
+
+
+def _gsm8k_correct(pred_text: str | None, full_text: str, gold: str) -> bool:
+    """GSM8K: plain numeric comparison (unchanged behavior from before --dataset
+    existed -- still covered by the existing smoke-test path)."""
+    raw = pred_text
+    if raw is None:
+        # No "Answer:" line at all -- fall back to the last number in the
+        # completion so a near-miss still gets partial signal from format_reward
+        # even though correctness_reward will very likely score it 0.
+        found = _ANY_NUMBER.findall(full_text)
+        if not found:
+            return False
+        raw = found[-1]
+    raw = raw.replace(",", "").replace("$", "")
+    try:
+        return abs(float(raw) - float(gold)) < 1e-4
+    except (TypeError, ValueError):
+        return False
+
+
+def _mv_parse_one(s: str) -> list:
+    # Wrapping in $...$ is required for math_verify's LaTeX extractor to parse bare
+    # (non-boxed) expressions like "\dfrac{7}{20}" or "p - q" -- confirmed empirically:
+    # unwrapped, both fail to parse (return []); wrapped, both parse and compare
+    # correctly. A trailing period ("...12.") also breaks the wrapped parse, so strip
+    # it first.
+    s = s.strip().rstrip(".").strip()
+    if not s:
+        return []
+    return mv_parse(f"${s}$") or mv_parse(s)
+
+
+def math_equal(pred: str, gold: str) -> bool:
+    """MATH: symbolic/numeric equivalence via math-verify. ``gold`` must parse
+    (else we can't check anything and return False); ``verify`` is NOT symmetric,
+    gold goes first.
+    """
+    g = _mv_parse_one(gold)
+    if not g:
+        return False
+    p = _mv_parse_one(pred)
+    return bool(p) and mv_verify(g, p)
+
+
+def _math_correct(pred_text: str | None, full_text: str, gold: str) -> bool:
+    if pred_text is None:
+        return False
+    return math_equal(pred_text, gold)
+
+
+CORRECTNESS_CHECKERS = {"gsm8k": _gsm8k_correct, "math": _math_correct}
+
+
+def make_correctness_reward(dataset: str):
+    """Build a ``correctness_reward`` closure using the checker for ``dataset``.
+    Always named/reported as ``correctness_reward`` (``rewards/correctness_reward/mean``
+    etc.) regardless of dataset, so dashboards stay comparable across --dataset switches.
+    """
+    checker = CORRECTNESS_CHECKERS[dataset]
+
+    def correctness_reward(completions, answer, **kwargs) -> list[float]:
+        rewards = []
+        for completion, gold in zip(completions, answer):
+            text = _completion_text(completion)
+            rewards.append(1.0 if checker(_answer_line_text(text), text, gold) else 0.0)
+        return rewards
+
+    correctness_reward.__name__ = "correctness_reward"
+    return correctness_reward
 
 
 # --------------------------------------------------------------------------- #
@@ -375,8 +478,8 @@ class PrefixLMGRPOTrainer(GRPOTrainer):
 # mirrors what PrefixLMGRPOTrainer does internally, but standalone for a plain
 # model.generate() call).
 # --------------------------------------------------------------------------- #
-def render_and_encode(tokenizer, question: str, *, reasoning: bool, device: str):
-    messages = [{"role": "user", "content": f"{question}\n\n{INSTRUCTION}"}]
+def render_and_encode(tokenizer, question: str, *, instruction: str, reasoning: bool, device: str):
+    messages = [{"role": "user", "content": f"{question}\n\n{instruction}"}]
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True, enable_thinking=reasoning
     )
@@ -395,7 +498,7 @@ def render_and_encode(tokenizer, question: str, *, reasoning: bool, device: str)
 
 # --------------------------------------------------------------------------- #
 # --check-prefix-lm: quick echo of eval.py's bidirectional-vs-causal ARC probe,
-# on GSM8K, so a broken token_type_ids wire-up is caught before a real run.
+# so a broken token_type_ids wire-up is caught before a real run.
 # --------------------------------------------------------------------------- #
 def check_prefix_lm(args) -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -405,14 +508,17 @@ def check_prefix_lm(args) -> None:
     device = _resolve_device(args.device)
     model = model.to(device)
 
-    ds = build_gsm8k_dataset(split="test", max_samples=args.check_samples)
-    print(f"[check-prefix-lm] {len(ds)} GSM8K test examples, reasoning={args.reasoning}")
+    build = DATASET_BUILDERS[args.dataset]
+    instruction = DATASET_INSTRUCTIONS[args.dataset]
+    checker = CORRECTNESS_CHECKERS[args.dataset]
+    ds = build(split="test", max_samples=args.check_samples)
+    print(f"[check-prefix-lm] {len(ds)} {args.dataset} (test) examples, reasoning={args.reasoning}")
 
     for label, bidirectional in (("bidirectional (as trained)", True), ("causal (ablation)", False)):
         correct = 0
         for example in ds:
-            question = example["prompt"][0]["content"].split("\n\n" + INSTRUCTION)[0]
-            enc = render_and_encode(tokenizer, question, reasoning=args.reasoning, device=device)
+            question = example["prompt"][0]["content"].split("\n\n" + instruction)[0]
+            enc = render_and_encode(tokenizer, question, instruction=instruction, reasoning=args.reasoning, device=device)
             if not bidirectional:
                 enc["token_type_ids"] = torch.zeros_like(enc["token_type_ids"])
             with torch.no_grad():
@@ -420,9 +526,7 @@ def check_prefix_lm(args) -> None:
                     **enc, max_new_tokens=args.check_max_new_tokens, do_sample=False
                 )
             text = tokenizer.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True)
-            pred = _extract_prediction(text)
-            gold = float(example["answer"])
-            if pred is not None and abs(pred - gold) < 1e-4:
+            if checker(_answer_line_text(text), text, example["answer"]):
                 correct += 1
         acc = correct / len(ds)
         print(f"[check-prefix-lm] {label}: {correct}/{len(ds)} = {acc:.3f}")
@@ -442,9 +546,9 @@ def _resolve_device(device: str) -> str:
 # --smoke-test: build one real batch and assert the plumbing is correct before
 # spending any compute on optimizer steps.
 # --------------------------------------------------------------------------- #
-def run_self_check(trainer: PrefixLMGRPOTrainer, tokenizer, reasoning: bool) -> None:
+def run_self_check(trainer: PrefixLMGRPOTrainer, tokenizer, reasoning: bool, instruction: str) -> None:
     prompts = [
-        {"prompt": [{"role": "user", "content": f"What is {i} + {i}?\n\n{INSTRUCTION}"}], "answer": str(2 * i)}
+        {"prompt": [{"role": "user", "content": f"What is {i} + {i}?\n\n{instruction}"}], "answer": str(2 * i)}
         for i in range(1, 4)
     ]
     prompt_ids, _, multimodal_fields = trainer._tokenize_prompts([p["prompt"] for p in prompts])
@@ -496,13 +600,43 @@ def run_lr_scaling_check(trainer: PrefixLMGRPOTrainer, base_lr: float) -> None:
     )
 
 
+def run_reward_check(dataset: str) -> None:
+    """Real assertions on the active dataset's correctness checker -- the
+    math-verify wiring for --dataset math is the riskiest new code path here and
+    deserves more than a compile check before spending any real compute on it.
+    """
+    checker = CORRECTNESS_CHECKERS[dataset]
+    if dataset == "gsm8k":
+        cases = [
+            ("42", "text", "42", True),
+            ("41", "text", "42", False),
+            (None, "no answer line here", "42", False),
+        ]
+    else:
+        cases = [
+            ("\\dfrac{7}{20}", "text", "\\frac{7}{20}", True),  # different fraction macros
+            ("p-q", "text", "p - q", True),  # spacing
+            ("3", "text", "2", False),
+            (None, "no answer line here", "2", False),
+        ]
+    for pred, full, gold, want in cases:
+        got = checker(pred, full, gold)
+        assert got == want, f"{dataset} checker({pred!r}, ..., {gold!r}) = {got}, expected {want}"
+    print(f"[self-check] {dataset} correctness checker: {len(cases)}/{len(cases)} cases OK")
+
+
 # --------------------------------------------------------------------------- #
 # CLI / main.
 # --------------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=DEFAULT_MODEL, help="HF id or local dir (default: %(default)s).")
-    parser.add_argument("--output-dir", default="./outputs/grpo-gsm8k")
+    parser.add_argument("--output-dir", default=None,
+                         help="Default: ./outputs/grpo-<dataset> (avoids gsm8k/math runs clobbering "
+                              "each other's checkpoints).")
+    parser.add_argument("--dataset", choices=["gsm8k", "math"], default="gsm8k",
+                         help="'gsm8k' (default, openai/gsm8k) or 'math' "
+                             "(nlile/hendrycks-MATH-benchmark; its test split is MATH-500).")
     parser.add_argument("--dataset-split", default="train")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit training examples (debugging).")
     parser.add_argument("--max-prompt-tokens", type=int, default=512, help="Filter out longer prompts.")
@@ -566,13 +700,15 @@ def parse_args() -> argparse.Namespace:
     eval_group = parser.add_mutually_exclusive_group()
     eval_group.add_argument(
         "--eval", dest="do_periodic_eval", action="store_true", default=True,
-        help="Periodic validation eval on a held-out GSM8K split, every --eval-steps (default).",
+        help="Periodic validation eval on a held-out split, every --eval-steps (default). "
+             "For --dataset math this is MATH-500.",
     )
     eval_group.add_argument(
         "--no-eval", dest="do_periodic_eval", action="store_false",
         help="Disable periodic validation eval.",
     )
-    parser.add_argument("--eval-split", default="test", help="GSM8K split for validation (default: %(default)s).")
+    parser.add_argument("--eval-split", default="test",
+                         help="Validation split (default: %(default)s); for --dataset math this is MATH-500.")
     parser.add_argument("--eval-samples", type=int, default=200,
                          help="Held-out examples per eval pass (default: %(default)s). Each one gets a full "
                               "rollout, so this trades eval cost for a tighter estimate.")
@@ -609,7 +745,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke-test", action="store_true",
                          help="Tiny run (~2 min) that self-checks the PrefixLM plumbing, for a local sanity pass.")
     parser.add_argument("--check-prefix-lm", action="store_true",
-                         help="Compare bidirectional vs. causal prompt attention on a small GSM8K sample, then exit.")
+                         help="Compare bidirectional vs. causal prompt attention on a small sample of "
+                              "--dataset, then exit.")
     parser.add_argument("--check-samples", type=int, default=16)
     parser.add_argument("--check-max-new-tokens", type=int, default=512)
 
@@ -650,7 +787,8 @@ def main() -> None:
         return
 
     device = _resolve_device(args.device)
-    print(f"[setup] model={args.model} device={device} dtype={args.dtype} reasoning={args.reasoning}")
+    print(f"[setup] model={args.model} dataset={args.dataset} device={device} dtype={args.dtype} "
+          f"reasoning={args.reasoning}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left", truncation_side="left")
 
@@ -687,17 +825,25 @@ def main() -> None:
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         )
 
-    train_dataset = build_gsm8k_dataset(split=args.dataset_split, max_samples=args.max_samples)
+    build = DATASET_BUILDERS[args.dataset]
+    instruction = DATASET_INSTRUCTIONS[args.dataset]
+
+    train_dataset = build(split=args.dataset_split, max_samples=args.max_samples)
     train_dataset = filter_by_prompt_length(train_dataset, tokenizer, args.max_prompt_tokens)
-    print(f"[dataset] {len(train_dataset)} GSM8K ({args.dataset_split}) examples")
+    print(f"[dataset] {len(train_dataset)} {args.dataset} ({args.dataset_split}) examples")
 
     eval_dataset = None
     eval_num_generations = args.eval_num_generations or args.num_generations
     if args.do_periodic_eval:
-        eval_dataset = build_gsm8k_dataset(split=args.eval_split, max_samples=args.eval_samples)
+        # For --dataset math, args.eval_split ("test") is MATH-500 -- used here the
+        # same way GSM8K's test split already is: a watched validation signal during
+        # training, not a pristine held-out set for final reporting.
+        eval_dataset = build(split=args.eval_split, max_samples=args.eval_samples)
         eval_dataset = filter_by_prompt_length(eval_dataset, tokenizer, args.max_prompt_tokens)
-        print(f"[dataset] {len(eval_dataset)} GSM8K ({args.eval_split}) held-out eval examples, "
+        print(f"[dataset] {len(eval_dataset)} {args.dataset} ({args.eval_split}) held-out eval examples, "
               f"every {args.eval_steps} steps")
+
+    output_dir = args.output_dir or f"./outputs/grpo-{args.dataset}"
 
     report_to = [] if args.report_to.lower() == "none" else [s.strip() for s in args.report_to.split(",")]
 
@@ -705,7 +851,7 @@ def main() -> None:
     if run_name is None:
         tag = "lora" if args.lora else "full"
         reasoning_tag = "reasoning" if args.reasoning else "direct"
-        run_name = f"grpo-gsm8k-{args.model.split('/')[-1]}-{tag}-{reasoning_tag}"
+        run_name = f"grpo-{args.dataset}-{args.model.split('/')[-1]}-{tag}-{reasoning_tag}"
 
     if "wandb" in report_to:
         # WandbCallback.setup() reads these env vars at wandb.init() time; must
@@ -717,7 +863,7 @@ def main() -> None:
         print(f"[wandb] project={args.wandb_project} run={run_name} log_model={args.wandb_log_model}")
 
     config = GRPOConfig(
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         model_init_kwargs=model_init_kwargs,
         chat_template_kwargs={"enable_thinking": args.reasoning},
         beta=args.beta,
@@ -753,7 +899,7 @@ def main() -> None:
 
     trainer = PrefixLMGRPOTrainer(
         model=args.model,
-        reward_funcs=[correctness_reward, format_reward],
+        reward_funcs=[make_correctness_reward(args.dataset), format_reward],
         args=config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -764,20 +910,21 @@ def main() -> None:
     )
 
     if args.smoke_test:
-        run_self_check(trainer, tokenizer, args.reasoning)
+        run_self_check(trainer, tokenizer, args.reasoning, instruction)
+        run_reward_check(args.dataset)
         if lr_scales is not None:
             run_lr_scaling_check(trainer, args.learning_rate)
 
     resume = args.resume_from_checkpoint
     if resume == "auto":
         resume = True
-    print(f"[checkpoints] every {args.save_steps} steps -> {args.output_dir}/checkpoint-<step> "
+    print(f"[checkpoints] every {args.save_steps} steps -> {output_dir}/checkpoint-<step> "
           f"(keeping last {args.save_total_limit})")
 
     trainer.train(resume_from_checkpoint=resume)
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    print(f"[done] saved to {args.output_dir}")
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"[done] saved to {output_dir}")
 
 
 if __name__ == "__main__":
