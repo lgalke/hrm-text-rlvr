@@ -62,6 +62,7 @@ Usage
     python train_grpo.py --report-to none                # disable W&B
     python train_grpo.py --resume-from-checkpoint auto    # resume the latest checkpoint in --output-dir
     python train_grpo.py --no-eval                        # disable periodic validation eval
+    python train_grpo.py --temperature 0.7                 # lower-entropy rollouts (default: 1.0)
 """
 
 from __future__ import annotations
@@ -374,6 +375,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=int, default=64)
 
     parser.add_argument("--beta", type=float, default=0.0, help="KL coefficient; 0 skips the reference model.")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                         help="Sampling temperature for rollout generation (default: %(default)s).")
     parser.add_argument("--num-generations", type=int, default=8)
     parser.add_argument("--per-device-train-batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
@@ -537,6 +540,7 @@ def main() -> None:
         model_init_kwargs=model_init_kwargs,
         chat_template_kwargs={"enable_thinking": args.reasoning},
         beta=args.beta,
+        temperature=args.temperature,
         num_generations=args.num_generations,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,

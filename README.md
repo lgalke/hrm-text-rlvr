@@ -66,6 +66,9 @@ python train_grpo.py --no-reasoning
 # Disable W&B / resume an interrupted run.
 python train_grpo.py --report-to none
 python train_grpo.py --resume-from-checkpoint auto
+
+# Lower the rollout sampling temperature (default: 1.0).
+python train_grpo.py --temperature 0.7
 ```
 
 Run `python train_grpo.py --help` for the full flag list (batch size, generations per prompt,
